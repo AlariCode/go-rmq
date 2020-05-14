@@ -2,6 +2,7 @@ package rmq
 
 import (
 	"fmt"
+	"github.com/CHH/eventemitter"
 	"github.com/isayme/go-amqp-reconnect/rabbitmq"
 	"github.com/streadway/amqp"
 	"log"
@@ -28,6 +29,7 @@ type RMQService struct {
 	ch         *rabbitmq.Channel
 	configs    RMQConfig
 	replyQueue string
+	replyEvent eventemitter.EventEmitter
 }
 
 func NewRMQService() RMQService {
@@ -37,6 +39,7 @@ func NewRMQService() RMQService {
 func (s *RMQService) Connect(config RMQConfig) {
 	rabbitmq.Debug = true
 	s.configs = config
+	s.replyEvent = *eventemitter.New()
 	s.replyQueue = "amq.rabbitmq.reply-to"
 	connectionString := fmt.Sprintf("amqp://%s:%s@%s:5672", config.Login, config.Password, config.Host)
 	conn, err := rabbitmq.Dial(connectionString)
@@ -47,6 +50,7 @@ func (s *RMQService) Connect(config RMQConfig) {
 	failOnError(err, "Failed to open a channel")
 	s.ch = ch
 	defer ch.Close()
+	s.listenReply()
 
 	if config.Queue != "" {
 		ch.QueueDeclare(
@@ -70,7 +74,25 @@ func (s *RMQService) Connect(config RMQConfig) {
 		failOnError(err, "Failed to set QoS")
 		s.listen()
 	}
+}
 
+func (s *RMQService) Send(topic string, msg []byte, resp chan []byte) {
+	correlationId := randomString(12)
+	err := s.ch.Publish(
+		s.configs.Exchange,
+		topic,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:   "text/json",
+			Body:          msg,
+			CorrelationId: correlationId,
+		})
+	failOnError(err, "Failed to publish a message")
+	s.replyEvent.On(correlationId, func(msg []byte) {
+		s.replyEvent.RemoveListeners(correlationId)
+		resp <- msg
+	})
 }
 
 func (s *RMQService) listen() {
@@ -109,7 +131,27 @@ func (s *RMQService) listen() {
 			msg.Ack(false)
 		}
 	}()
-	log.Printf(" [*] Awaiting RPC requests")
+	log.Printf("[*] Awaiting RPC requests")
+	<-forever
+}
+
+func (s *RMQService) listenReply() {
+	msgs, err := s.ch.Consume(
+		s.replyQueue,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	failOnError(err, "Failed to register a consumer on replyQueue")
+	forever := make(chan bool)
+	go func() {
+		for msg := range msgs {
+			<-s.replyEvent.Emit(msg.CorrelationId, msg)
+		}
+	}()
 	<-forever
 }
 
