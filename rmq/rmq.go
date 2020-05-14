@@ -139,7 +139,7 @@ func (s *RMQService) listenReply() {
 	msgs, err := s.ch.Consume(
 		s.replyQueue,
 		"",
-		false,
+		true,
 		false,
 		false,
 		false,
