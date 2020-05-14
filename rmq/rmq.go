@@ -146,13 +146,11 @@ func (s *RMQService) listenReply() {
 		nil,
 	)
 	failOnError(err, "Failed to register a consumer on replyQueue")
-	forever := make(chan bool)
 	go func() {
 		for msg := range msgs {
 			<-s.replyEvent.Emit(msg.CorrelationId, msg)
 		}
 	}()
-	<-forever
 }
 
 func failOnError(err error, msg string) {
