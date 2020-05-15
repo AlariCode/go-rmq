@@ -26,10 +26,12 @@ type RMQ interface {
 }
 
 type RMQService struct {
+	conn       *rabbitmq.Connection
 	ch         *rabbitmq.Channel
 	configs    RMQConfig
 	replyQueue amqp.Queue
 	replyEvent eventemitter.EventEmitter
+	exitCh     chan bool
 }
 
 func NewRMQService() RMQService {
@@ -39,9 +41,11 @@ func NewRMQService() RMQService {
 func (s *RMQService) Connect(config RMQConfig) bool {
 	rabbitmq.Debug = true
 	s.configs = config
+	s.exitCh = make(chan bool)
 	s.replyEvent = *eventemitter.New()
 	connectionString := fmt.Sprintf("amqp://%s:%s@%s:5672", config.Login, config.Password, config.Host)
 	conn, err := rabbitmq.Dial(connectionString)
+	s.conn = conn
 	failOnError(err, "Failed to connect to RabbitMQ")
 	//defer conn.Close()
 
@@ -71,9 +75,15 @@ func (s *RMQService) Connect(config RMQConfig) bool {
 			err = ch.QueueBind(config.Queue, path, config.Exchange, false, nil)
 			failOnError(err, fmt.Sprintf("failed to bind queue %s", path))
 		}
-		s.listen()
 	}
 	return true
+}
+
+func (s *RMQService) Disconnect() {
+	s.ch.Close()
+	s.conn.Close()
+	s.exitCh <- true
+	close(s.exitCh)
 }
 
 func (s *RMQService) Send(topic string, msg []byte, resp chan []byte) {
@@ -96,7 +106,7 @@ func (s *RMQService) Send(topic string, msg []byte, resp chan []byte) {
 	})
 }
 
-func (s *RMQService) listen() {
+func (s *RMQService) Listen() {
 	msgs, err := s.ch.Consume(
 		s.configs.Queue,
 		"",
@@ -132,6 +142,7 @@ func (s *RMQService) listen() {
 		}
 	}()
 	log.Printf("[*] Awaiting RPC requests")
+	<-s.exitCh
 }
 
 func (s *RMQService) listenReply() {
@@ -160,11 +171,6 @@ func (s *RMQService) listenReply() {
 			s.replyEvent.Emit(msg.CorrelationId, msg)
 		}
 	}()
-}
-
-func (s *RMQService) WaitForMessages() {
-	forever := make(chan bool)
-	<-forever
 }
 
 func failOnError(err error, msg string) {
