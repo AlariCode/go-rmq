@@ -28,7 +28,7 @@ type RMQ interface {
 type RMQService struct {
 	ch         *rabbitmq.Channel
 	configs    RMQConfig
-	replyQueue string
+	replyQueue amqp.Queue
 	replyEvent eventemitter.EventEmitter
 }
 
@@ -36,20 +36,25 @@ func NewRMQService() RMQService {
 	return RMQService{}
 }
 
-func (s *RMQService) Connect(config RMQConfig) {
+func (s *RMQService) Connect(config RMQConfig) bool {
 	rabbitmq.Debug = true
 	s.configs = config
 	s.replyEvent = *eventemitter.New()
-	s.replyQueue = "amq.rabbitmq.reply-to"
 	connectionString := fmt.Sprintf("amqp://%s:%s@%s:5672", config.Login, config.Password, config.Host)
 	conn, err := rabbitmq.Dial(connectionString)
 	failOnError(err, "Failed to connect to RabbitMQ")
-	defer conn.Close()
+	//defer conn.Close()
 
 	ch, err := conn.Channel()
 	failOnError(err, "Failed to open a channel")
 	s.ch = ch
-	defer ch.Close()
+	//defer ch.Close()
+	err = ch.Qos(
+		config.PrefetchCount,
+		0,
+		false,
+	)
+	failOnError(err, "Failed to set QoS")
 	s.listenReply()
 
 	if config.Queue != "" {
@@ -66,18 +71,13 @@ func (s *RMQService) Connect(config RMQConfig) {
 			err = ch.QueueBind(config.Queue, path, config.Exchange, false, nil)
 			failOnError(err, fmt.Sprintf("failed to bind queue %s", path))
 		}
-		err = ch.Qos(
-			config.PrefetchCount,
-			0,
-			false,
-		)
-		failOnError(err, "Failed to set QoS")
 		s.listen()
 	}
+	return true
 }
 
 func (s *RMQService) Send(topic string, msg []byte, resp chan []byte) {
-	correlationId := randomString(12)
+	correlationId := randomString(32)
 	err := s.ch.Publish(
 		s.configs.Exchange,
 		topic,
@@ -87,11 +87,12 @@ func (s *RMQService) Send(topic string, msg []byte, resp chan []byte) {
 			ContentType:   "text/json",
 			Body:          msg,
 			CorrelationId: correlationId,
+			ReplyTo:       s.replyQueue.Name,
 		})
 	failOnError(err, "Failed to publish a message")
-	s.replyEvent.On(correlationId, func(msg []byte) {
+	s.replyEvent.On(correlationId, func(msg amqp.Delivery) {
 		s.replyEvent.RemoveListeners(correlationId)
-		resp <- msg
+		resp <- msg.Body
 	})
 }
 
@@ -106,7 +107,6 @@ func (s *RMQService) listen() {
 		nil,
 	)
 	failOnError(err, "Failed to register a consumer")
-	forever := make(chan bool)
 	go func() {
 		for msg := range msgs {
 			resp, err := s.configs.Routes[msg.RoutingKey](msg.Body)
@@ -132,12 +132,21 @@ func (s *RMQService) listen() {
 		}
 	}()
 	log.Printf("[*] Awaiting RPC requests")
-	<-forever
 }
 
 func (s *RMQService) listenReply() {
+	q, err := s.ch.QueueDeclare(
+		"",
+		false,
+		false,
+		true,
+		false,
+		nil,
+	)
+	s.replyQueue = q
+	failOnError(err, "Failed to declare replyQueue")
 	msgs, err := s.ch.Consume(
-		s.replyQueue,
+		q.Name,
 		"",
 		true,
 		false,
@@ -148,9 +157,14 @@ func (s *RMQService) listenReply() {
 	failOnError(err, "Failed to register a consumer on replyQueue")
 	go func() {
 		for msg := range msgs {
-			<-s.replyEvent.Emit(msg.CorrelationId, msg)
+			s.replyEvent.Emit(msg.CorrelationId, msg)
 		}
 	}()
+}
+
+func (s *RMQService) WaitForMessages() {
+	forever := make(chan bool)
+	<-forever
 }
 
 func failOnError(err error, msg string) {
@@ -160,20 +174,14 @@ func failOnError(err error, msg string) {
 }
 
 func randomString(l int) string {
-	rand.Seed(time.Now().UnixNano())
-	digits := "0123456789"
-	specials := "~=+%^*/()[]{}/!@#$?|"
-	all := "ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
-		"abcdefghijklmnopqrstuvwxyz" +
-		digits + specials
-	buf := make([]byte, l)
-	buf[0] = digits[rand.Intn(len(digits))]
-	buf[1] = specials[rand.Intn(len(specials))]
-	for i := 2; i < l; i++ {
-		buf[i] = all[rand.Intn(len(all))]
+	bytes := make([]byte, l)
+	for i := 0; i < l; i++ {
+		bytes[i] = byte(randInt(65, 90))
 	}
-	rand.Shuffle(len(buf), func(i, j int) {
-		buf[i], buf[j] = buf[j], buf[i]
-	})
-	return string(buf)
+	return string(bytes)
+}
+
+func randInt(min int, max int) int {
+	rand.Seed(time.Now().UnixNano())
+	return min + rand.Intn(max-min)
 }
