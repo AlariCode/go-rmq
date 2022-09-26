@@ -1,13 +1,15 @@
 package rmq
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/CHH/eventemitter"
-	"github.com/isayme/go-amqp-reconnect/rabbitmq"
-	"github.com/streadway/amqp"
 	"log"
 	"math/rand"
+	"sync"
 	"time"
+
+	"github.com/isayme/go-amqp-reconnect/rabbitmq"
+	"github.com/streadway/amqp"
 )
 
 type RMQConfig struct {
@@ -26,12 +28,12 @@ type RMQ interface {
 }
 
 type RMQService struct {
-	conn       *rabbitmq.Connection
-	ch         *rabbitmq.Channel
-	configs    RMQConfig
-	replyQueue amqp.Queue
-	replyEvent eventemitter.EventEmitter
-	exitCh     chan bool
+	conn           *rabbitmq.Connection
+	ch             *rabbitmq.Channel
+	configs        RMQConfig
+	replyQueue     amqp.Queue
+	exitCh         chan bool
+	correlationMap sync.Map
 }
 
 func NewRMQService() RMQService {
@@ -42,22 +44,21 @@ func (s *RMQService) Connect(config RMQConfig) bool {
 	rabbitmq.Debug = true
 	s.configs = config
 	s.exitCh = make(chan bool)
-	s.replyEvent = *eventemitter.New()
 	connectionString := fmt.Sprintf("amqp://%s:%s@%s:5672", config.Login, config.Password, config.Host)
 	conn, err := rabbitmq.Dial(connectionString)
 	s.conn = conn
 	failOnError(err, "Failed to connect to RabbitMQ")
-	//defer conn.Close()
-
 	ch, err := conn.Channel()
 	failOnError(err, "Failed to open a channel")
 	s.ch = ch
-	//defer ch.Close()
 	err = ch.Qos(
 		config.PrefetchCount,
 		0,
 		false,
 	)
+	if s.configs.Exchange != "" {
+		s.ch.ExchangeDeclare(s.configs.Exchange, "topic", true, false, false, false, make(amqp.Table))
+	}
 	failOnError(err, "Failed to set QoS")
 	s.listenReply()
 
@@ -100,10 +101,7 @@ func (s *RMQService) Send(topic string, msg []byte, resp chan []byte) {
 			ReplyTo:       s.replyQueue.Name,
 		})
 	failOnError(err, "Failed to publish a message")
-	s.replyEvent.On(correlationId, func(msg amqp.Delivery) {
-		s.replyEvent.RemoveListeners(correlationId)
-		resp <- msg.Body
-	})
+	s.correlationMap.Store(correlationId, resp)
 }
 
 func (s *RMQService) Listen() {
@@ -168,7 +166,11 @@ func (s *RMQService) listenReply() {
 	failOnError(err, "Failed to register a consumer on replyQueue")
 	go func() {
 		for msg := range msgs {
-			s.replyEvent.Emit(msg.CorrelationId, msg)
+			replyChannelValue, ok := s.correlationMap.LoadAndDelete(msg.CorrelationId)
+			if ok {
+				replyChannel := replyChannelValue.(chan []byte)
+				replyChannel <- msg.Body
+			}
 		}
 	}()
 }
@@ -190,4 +192,21 @@ func randomString(l int) string {
 func randInt(min int, max int) int {
 	rand.Seed(time.Now().UnixNano())
 	return min + rand.Intn(max-min)
+}
+
+func DecodeMsg[T interface{}](body []byte) (T, error) {
+	var msg T
+	err := json.Unmarshal(body, &msg)
+	if err != nil {
+		return msg, err
+	}
+	return msg, nil
+}
+
+func EncodeMsg[T interface{}](resp T) ([]byte, error) {
+	reply, err := json.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+	return reply, nil
 }
